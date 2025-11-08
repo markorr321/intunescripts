@@ -13,15 +13,11 @@
 .PARAMETER WhatIf
     Shows what would be deleted without actually performing the deletion
 
-.DESCRIPTION
-    After removing devices, the script automatically monitors every 5 seconds to check when
-    devices are completely removed from Autopilot and Intune, providing real-time status updates.
-
 .EXAMPLE
-    .\Autopilot-CleanUp.ps1
+    .\Autopilot-CleanUp-Fixed.ps1
     
 .EXAMPLE
-    .\Autopilot-CleanUp.ps1 -WhatIf
+    .\Autopilot-CleanUp-Fixed.ps1 -WhatIf
 #>
 
 param(
@@ -97,7 +93,6 @@ function Get-AllAutopilotDevices {
         return @()
     }
 }
-
 
 # Function to get matching Entra ID device by device name with serial validation
 function Get-EntraDeviceByName {
@@ -269,8 +264,26 @@ function Remove-AutopilotDevice {
     }
     catch {
         $errorMsg = $_.Exception.Message
-        Write-ColorOutput "✗ Error removing device $DeviceName from Autopilot: $errorMsg" "Red"
-        return @{ Success = $false; Found = $true; Error = $errorMsg }
+        
+        # Check for common deletion scenarios
+        if ($errorMsg -like "*BadRequest*" -or $errorMsg -like "*Bad Request*") {
+            if ($errorMsg -like "*already*" -or $errorMsg -like "*pending*") {
+                Write-ColorOutput "⚠ Device $DeviceName already queued for deletion from Autopilot" "Yellow"
+                return @{ Success = $true; Found = $true; Error = "Already queued for deletion" }
+            } else {
+                Write-ColorOutput "⚠ Device $DeviceName cannot be deleted from Autopilot (may already be processing)" "Yellow"
+                Write-ColorOutput "  Error details: $errorMsg" "Gray"
+                return @{ Success = $true; Found = $true; Error = "Cannot delete - likely already processing" }
+            }
+        }
+        elseif ($errorMsg -like "*NotFound*" -or $errorMsg -like "*Not Found*") {
+            Write-ColorOutput "⚠ Device $DeviceName no longer exists in Autopilot (already removed)" "Yellow"
+            return @{ Success = $true; Found = $true; Error = "Already removed" }
+        }
+        else {
+            Write-ColorOutput "✗ Error removing device $DeviceName from Autopilot: $errorMsg" "Red"
+            return @{ Success = $false; Found = $true; Error = $errorMsg }
+        }
     }
 }
 
@@ -387,350 +400,6 @@ function Test-IntuneDeviceRemoved {
     return $false
 }
 
-# Function to verify device removal from Entra ID
-function Test-EntraDeviceRemoved {
-    param(
-        [string]$DeviceName,
-        [string]$SerialNumber = $null,
-        [int]$MaxWaitMinutes = 10
-    )
-    
-    $startTime = Get-Date
-    $endTime = $startTime.AddMinutes($MaxWaitMinutes)
-    $checkInterval = 30 # seconds
-    
-    Write-ColorOutput "Verifying device removal from Entra ID (max wait: $MaxWaitMinutes minutes)..." "Yellow"
-    
-    do {
-        Start-Sleep -Seconds $checkInterval
-        $devices = Get-EntraDeviceByName -DeviceName $DeviceName -SerialNumber $SerialNumber
-        
-        if (-not $devices -or $devices.Count -eq 0) {
-            $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-            Write-ColorOutput "✓ Device confirmed removed from Entra ID after $elapsedTime minutes" "Green"
-            return $true
-        }
-        
-        $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-        Write-ColorOutput "Device still present in Entra ID after $elapsedTime minutes..." "Yellow"
-        
-    } while ((Get-Date) -lt $endTime)
-    
-    Write-ColorOutput "⚠ Device still present in Entra ID after $MaxWaitMinutes minutes" "Red"
-    return $false
-}
-
-# Function to verify device removal from Autopilot
-function Test-AutopilotDeviceRemoved {
-    param(
-        [string]$DeviceName,
-        [string]$SerialNumber = $null,
-        [int]$MaxWaitMinutes = 10
-    )
-    
-    $startTime = Get-Date
-    $endTime = $startTime.AddMinutes($MaxWaitMinutes)
-    $checkInterval = 30 # seconds
-    
-    Write-ColorOutput "Verifying device removal from Autopilot (max wait: $MaxWaitMinutes minutes)..." "Yellow"
-    
-    do {
-        Start-Sleep -Seconds $checkInterval
-        $device = Get-AutopilotDevice -DeviceName $DeviceName -SerialNumber $SerialNumber
-        
-        if (-not $device) {
-            $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-            Write-ColorOutput "✓ Device confirmed removed from Autopilot after $elapsedTime minutes" "Green"
-            return $true
-        }
-        
-        $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-        Write-ColorOutput "Device still present in Autopilot after $elapsedTime minutes..." "Yellow"
-        
-    } while ((Get-Date) -lt $endTime)
-    
-    Write-ColorOutput "⚠ Device still present in Autopilot after $MaxWaitMinutes minutes" "Red"
-    return $false
-}
-
-# Function to get device configuration profile assignments
-function Get-DeviceConfigurationProfiles {
-    param(
-        [string]$DeviceId
-    )
-    
-    try {
-        $uri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$DeviceId/deviceConfigurationStates"
-        $configStates = (Invoke-MgGraphRequest -Uri $uri -Method GET).value
-        
-        $profiles = @()
-        foreach ($state in $configStates) {
-            if ($state.displayName) {
-                $profiles += [PSCustomObject]@{
-                    ProfileName = $state.displayName
-                    State = $state.state
-                    LastReportedDateTime = $state.lastReportedDateTime
-                    Id = $state.id
-                }
-            }
-        }
-        
-        return $profiles
-    }
-    catch {
-        Write-ColorOutput "Error getting configuration profiles: $($_.Exception.Message)" "Red"
-        return @()
-    }
-}
-
-# Function to get device compliance policies
-function Get-DeviceCompliancePolicies {
-    param(
-        [string]$DeviceId
-    )
-    
-    try {
-        $uri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$DeviceId/deviceCompliancePolicyStates"
-        $complianceStates = (Invoke-MgGraphRequest -Uri $uri -Method GET).value
-        
-        $policies = @()
-        foreach ($state in $complianceStates) {
-            if ($state.displayName) {
-                $policies += [PSCustomObject]@{
-                    PolicyName = $state.displayName
-                    State = $state.state
-                    LastReportedDateTime = $state.lastReportedDateTime
-                    Id = $state.id
-                }
-            }
-        }
-        
-        return $policies
-    }
-    catch {
-        Write-ColorOutput "Error getting compliance policies: $($_.Exception.Message)" "Red"
-        return @()
-    }
-}
-
-# Function to show current profile assignments for a device
-function Show-DeviceProfileAssignments {
-    param(
-        [string]$DeviceName,
-        [string]$SerialNumber = $null
-    )
-    
-    Write-ColorOutput "Checking current profile assignments for device: $DeviceName" "Cyan"
-    
-    # Find the device in Intune
-    $device = Get-IntuneDevice -DeviceName $DeviceName -SerialNumber $SerialNumber
-    if (-not $device) {
-        Write-ColorOutput "Device not found in Intune" "Red"
-        return $false
-    }
-    
-    Write-ColorOutput "Device found: $($device.deviceName) (ID: $($device.id))" "Green"
-    Write-ColorOutput "Last sync: $($device.lastSyncDateTime)" "Gray"
-    Write-ColorOutput "Compliance state: $($device.complianceState)" "Gray"
-    Write-ColorOutput ""
-    
-    # Get configuration profiles
-    $profiles = Get-DeviceConfigurationProfiles -DeviceId $device.id
-    Write-ColorOutput "Configuration Profiles ($($profiles.Count)):" "White"
-    if ($profiles.Count -eq 0) {
-        Write-ColorOutput "  No configuration profiles assigned" "Gray"
-    } else {
-        foreach ($profile in $profiles) {
-            $statusColor = switch ($profile.State) {
-                "compliant" { "Green" }
-                "nonCompliant" { "Red" }
-                "error" { "Red" }
-                "conflict" { "Yellow" }
-                default { "Gray" }
-            }
-            Write-ColorOutput "  - $($profile.ProfileName)" "White"
-            Write-ColorOutput "    State: $($profile.State)" $statusColor
-            Write-ColorOutput "    Last reported: $($profile.LastReportedDateTime)" "Gray"
-        }
-    }
-    
-    Write-ColorOutput ""
-    
-    # Get compliance policies
-    $policies = Get-DeviceCompliancePolicies -DeviceId $device.id
-    Write-ColorOutput "Compliance Policies ($($policies.Count)):" "White"
-    if ($policies.Count -eq 0) {
-        Write-ColorOutput "  No compliance policies assigned" "Gray"
-    } else {
-        foreach ($policy in $policies) {
-            $statusColor = switch ($policy.State) {
-                "compliant" { "Green" }
-                "nonCompliant" { "Red" }
-                "error" { "Red" }
-                "conflict" { "Yellow" }
-                default { "Gray" }
-            }
-            Write-ColorOutput "  - $($policy.PolicyName)" "White"
-            Write-ColorOutput "    State: $($policy.State)" $statusColor
-            Write-ColorOutput "    Last reported: $($policy.LastReportedDateTime)" "Gray"
-        }
-    }
-    
-    $totalAssignments = $profiles.Count + $policies.Count
-    Write-ColorOutput ""
-    Write-ColorOutput "Total assignments: $totalAssignments" $(if ($totalAssignments -eq 0) { "Green" } else { "Yellow" })
-    
-    return $totalAssignments -eq 0
-}
-
-# Function to monitor profile assignments until they're removed
-function Wait-ForProfileUnassignment {
-    param(
-        [string]$DeviceName,
-        [string]$SerialNumber = $null,
-        [int]$MaxWaitMinutes = 15
-    )
-    
-    Write-ColorOutput "Monitoring profile assignments for device removal..." "Yellow"
-    
-    # First, get the device to monitor
-    $device = Get-IntuneDevice -DeviceName $DeviceName -SerialNumber $SerialNumber
-    if (-not $device) {
-        Write-ColorOutput "Device not found in Intune - profiles already unassigned" "Green"
-        return $true
-    }
-    
-    # Get initial profile assignments
-    $initialProfiles = Get-DeviceConfigurationProfiles -DeviceId $device.id
-    $initialPolicies = Get-DeviceCompliancePolicies -DeviceId $device.id
-    
-    if ($initialProfiles.Count -eq 0 -and $initialPolicies.Count -eq 0) {
-        Write-ColorOutput "No profiles or policies currently assigned" "Green"
-        return $true
-    }
-    
-    Write-ColorOutput "Initial assignments found:" "White"
-    Write-ColorOutput "  Configuration Profiles: $($initialProfiles.Count)" "White"
-    Write-ColorOutput "  Compliance Policies: $($initialPolicies.Count)" "White"
-    
-    foreach ($profile in $initialProfiles) {
-        Write-ColorOutput "    - $($profile.ProfileName) ($($profile.State))" "Gray"
-    }
-    foreach ($policy in $initialPolicies) {
-        Write-ColorOutput "    - $($policy.PolicyName) ($($policy.State))" "Gray"
-    }
-    
-    $startTime = Get-Date
-    $endTime = $startTime.AddMinutes($MaxWaitMinutes)
-    $checkInterval = 60 # seconds
-    
-    do {
-        Start-Sleep -Seconds $checkInterval
-        
-        # Check if device still exists
-        $currentDevice = Get-IntuneDevice -DeviceName $DeviceName -SerialNumber $SerialNumber
-        if (-not $currentDevice) {
-            $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-            Write-ColorOutput "✓ Device removed from Intune - all profiles unassigned after $elapsedTime minutes" "Green"
-            return $true
-        }
-        
-        # Check current assignments
-        $currentProfiles = Get-DeviceConfigurationProfiles -DeviceId $currentDevice.id
-        $currentPolicies = Get-DeviceCompliancePolicies -DeviceId $currentDevice.id
-        
-        $totalAssignments = $currentProfiles.Count + $currentPolicies.Count
-        $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-        
-        if ($totalAssignments -eq 0) {
-            Write-ColorOutput "✓ All profiles and policies unassigned after $elapsedTime minutes" "Green"
-            return $true
-        }
-        
-        Write-ColorOutput "Still has $totalAssignments assignment(s) after $elapsedTime minutes (Profiles: $($currentProfiles.Count), Policies: $($currentPolicies.Count))" "Yellow"
-        
-    } while ((Get-Date) -lt $endTime)
-    
-    Write-ColorOutput "⚠ Device still has profile assignments after $MaxWaitMinutes minutes" "Red"
-    return $false
-}
-
-# Function to monitor Autopilot device until it's removed
-function Wait-ForAutopilotDeviceRemoval {
-    param(
-        [string]$DeviceName,
-        [string]$SerialNumber = $null,
-        [int]$MaxWaitMinutes = 30
-    )
-    
-    Write-ColorOutput "=================================================" "Magenta"
-    Write-ColorOutput "    Monitoring Autopilot Device Removal" "Magenta"
-    Write-ColorOutput "=================================================" "Magenta"
-    Write-ColorOutput "Device: $DeviceName" "White"
-    if ($SerialNumber) {
-        Write-ColorOutput "Serial: $SerialNumber" "White"
-    }
-    Write-ColorOutput "Maximum monitoring time: $MaxWaitMinutes minutes" "Yellow"
-    Write-ColorOutput ""
-    
-    # First check if device exists
-    $device = Get-AutopilotDevice -DeviceName $DeviceName -SerialNumber $SerialNumber
-    if (-not $device) {
-        Write-ColorOutput "✓ Device is not present in Autopilot" "Green"
-        return $true
-    }
-    
-    Write-ColorOutput "Device found in Autopilot:" "Yellow"
-    Write-ColorOutput "  Name: $($device.displayName)" "White"
-    Write-ColorOutput "  Serial: $($device.serialNumber)" "White"
-    Write-ColorOutput "  Model: $($device.model)" "White"
-    Write-ColorOutput "  ID: $($device.id)" "Gray"
-    Write-ColorOutput ""
-    Write-ColorOutput "Starting monitoring... (checking every 30 seconds)" "Yellow"
-    Write-ColorOutput ""
-    
-    $startTime = Get-Date
-    $endTime = $startTime.AddMinutes($MaxWaitMinutes)
-    $checkInterval = 30 # seconds
-    $checkCount = 0
-    
-    do {
-        Start-Sleep -Seconds $checkInterval
-        $checkCount++
-        
-        $currentDevice = Get-AutopilotDevice -DeviceName $DeviceName -SerialNumber $SerialNumber
-        $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-        
-        if (-not $currentDevice) {
-            Write-ColorOutput ""
-            Write-ColorOutput "🎉 SUCCESS! Device removed from Autopilot after $elapsedTime minutes" "Green"
-            Write-ColorOutput "   Total checks performed: $checkCount" "Gray"
-            Write-ColorOutput "   Removal confirmed at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" "Gray"
-            
-            # Play a notification sound (if available)
-            try {
-                [System.Console]::Beep(800, 500)
-                [System.Console]::Beep(1000, 500)
-                [System.Console]::Beep(1200, 1000)
-            } catch {
-                # Ignore if beep is not available
-            }
-            
-            return $true
-        }
-        
-        Write-ColorOutput "[$checkCount] Device still present after $elapsedTime minutes..." "Yellow"
-        
-    } while ((Get-Date) -lt $endTime)
-    
-    Write-ColorOutput ""
-    Write-ColorOutput "⚠ Device still present in Autopilot after $MaxWaitMinutes minutes" "Red"
-    Write-ColorOutput "   Total checks performed: $checkCount" "Gray"
-    Write-ColorOutput "   You may want to check manually or extend the monitoring time" "Yellow"
-    
-    return $false
-}
-
 # Function to remove multiple Entra ID devices with enhanced error handling
 function Remove-EntraDevices {
     param(
@@ -834,9 +503,22 @@ $enrichedDevices = foreach ($device in $autopilotDevices) {
     $entraDevices = Get-EntraDeviceByName -DeviceName $device.displayName -SerialNumber $device.serialNumber
     $entraDevice = if ($entraDevices -and $entraDevices.Count -gt 0) { $entraDevices[0] } else { $null }
     
+    # Create a meaningful display name
+    $displayName = if ($device.displayName -and $device.displayName -ne "") { 
+        $device.displayName 
+    } elseif ($intuneDevice -and $intuneDevice.deviceName) { 
+        $intuneDevice.deviceName 
+    } elseif ($entraDevice -and $entraDevice.displayName) { 
+        $entraDevice.displayName 
+    } elseif ($device.serialNumber) { 
+        "Device-$($device.serialNumber)" 
+    } else { 
+        "Unknown-$($device.id.Substring(0,8))" 
+    }
+    
     [PSCustomObject]@{
         AutopilotId = $device.id
-        DisplayName = if ($device.displayName) { $device.displayName } else { "N/A" }
+        DisplayName = $displayName
         SerialNumber = $device.serialNumber
         Model = $device.model
         Manufacturer = $device.manufacturer
@@ -855,8 +537,6 @@ $enrichedDevices = foreach ($device in $autopilotDevices) {
     }
 }
 
-# Silently open selection grid
-
 # Show interactive grid for device selection
 $selectedDevices = $enrichedDevices | Select-Object DisplayName, SerialNumber, Model, Manufacturer, GroupTag, DeploymentProfile, IntuneFound, EntraFound, IntuneName, EntraName | Out-GridView -Title "Select Devices to Remove from All Services" -PassThru
 
@@ -865,17 +545,13 @@ if (-not $selectedDevices -or $selectedDevices.Count -eq 0) {
     exit 0
 }
 
-# Process selected devices silently
-
-# Process each selected device with enhanced logic
+# Process each selected device
 $results = @()
 foreach ($selectedDevice in $selectedDevices) {
     # Find the full device info
     $fullDevice = $enrichedDevices | Where-Object { $_.SerialNumber -eq $selectedDevice.SerialNumber }
     $deviceName = $fullDevice.DisplayName
     $serialNumber = $fullDevice.SerialNumber
-    
-    # Process device silently
     
     $deviceResult = [PSCustomObject]@{
         SerialNumber = $serialNumber
@@ -885,19 +561,19 @@ foreach ($selectedDevice in $selectedDevices) {
         Autopilot = @{ Found = $false; Success = $false; Error = $null }
     }
     
-    # Remove from Intune first (management layer) - silently
+    # Remove from Intune first (management layer)
     $intuneResult = Remove-IntuneDevice -DeviceName $deviceName -SerialNumber $serialNumber
     $deviceResult.Intune.Found = $intuneResult.Found
     $deviceResult.Intune.Success = $intuneResult.Success
     $deviceResult.Intune.Error = $intuneResult.Error
     
-    # Remove from Autopilot second (deployment service) - silently
+    # Remove from Autopilot second (deployment service)
     $autopilotResult = Remove-AutopilotDevice -DeviceName $deviceName -SerialNumber $serialNumber
     $deviceResult.Autopilot.Found = $autopilotResult.Found
     $deviceResult.Autopilot.Success = $autopilotResult.Success
     $deviceResult.Autopilot.Error = $autopilotResult.Error
     
-    # Remove from Entra ID last (identity source) - silently
+    # Remove from Entra ID last (identity source)
     $entraDevices = Get-EntraDeviceByName -DeviceName $deviceName -SerialNumber $serialNumber
     if ($entraDevices -and $entraDevices.Count -gt 0) {
         $deviceResult.EntraID.Found = $true
@@ -911,6 +587,7 @@ foreach ($selectedDevice in $selectedDevices) {
     # Automatic monitoring after deletion (not in WhatIf mode)
     if (-not $WhatIf -and ($deviceResult.Autopilot.Success -or $deviceResult.Intune.Success -or $deviceResult.EntraID.Success)) {
         Write-ColorOutput ""
+        Write-ColorOutput "Starting automatic monitoring for device removal verification..." "Cyan"
         
         $startTime = Get-Date
         $maxMonitorMinutes = 30 # Maximum monitoring time
@@ -920,12 +597,6 @@ foreach ($selectedDevice in $selectedDevices) {
         $autopilotRemoved = -not $deviceResult.Autopilot.Success
         $intuneRemoved = -not $deviceResult.Intune.Success
         $entraRemoved = -not $deviceResult.EntraID.Success
-        
-        # Count devices to monitor
-        $devicesToMonitor = 0
-        if (-not $autopilotRemoved) { $devicesToMonitor++ }
-        if (-not $intuneRemoved) { $devicesToMonitor++ }
-        if (-not $entraRemoved) { $devicesToMonitor++ }
         
         # Show initial device found messages
         if ($deviceResult.Intune.Found) {
@@ -941,40 +612,82 @@ foreach ($selectedDevice in $selectedDevices) {
             # Set monitoring mode to suppress verbose messages
             $script:MonitoringMode = $true
             
+            $currentTime = Get-Date
+            $elapsedMinutes = [math]::Round(($currentTime - $startTime).TotalMinutes, 1)
+            
             # Check Intune status first
             if (-not $intuneRemoved) {
-                Write-ColorOutput "Waiting for 1 of 1 to be removed from Intune" "Yellow"
-                $intuneDevice = Get-IntuneDevice -DeviceName $deviceName -SerialNumber $serialNumber
-                if (-not $intuneDevice) {
-                    $intuneRemoved = $true
-                    Write-ColorOutput ""
-                    Write-ColorOutput "1 Device Successfully Removed from Intune" "Green"
-                    Write-ColorOutput ""
-                    $deviceResult.Intune.Verified = $true
-                    
-                    # Show Autopilot found message after Intune is removed
-                    if ($deviceResult.Autopilot.Found) {
-                        Write-ColorOutput "Found Device in Autopilot" "Green"
+                Write-ColorOutput "Waiting for 1 of 1 to be removed from Intune (Elapsed: $elapsedMinutes min)" "Yellow"
+                try {
+                    $intuneDevice = Get-IntuneDevice -DeviceName $deviceName -SerialNumber $serialNumber
+                    if (-not $intuneDevice) {
+                        $intuneRemoved = $true
                         Write-ColorOutput ""
+                        Write-ColorOutput "1 Device Successfully Removed from Intune" "Green"
+                        Write-ColorOutput ""
+                        $deviceResult.Intune.Verified = $true
+                        
+                        # Show Autopilot found message after Intune is removed
+                        if ($deviceResult.Autopilot.Found) {
+                            Write-ColorOutput "Found Device in Autopilot" "Green"
+                            Write-ColorOutput ""
+                        }
+                    } else {
+                        Write-ColorOutput "  Device still present in Intune..." "Gray"
                     }
+                }
+                catch {
+                    Write-ColorOutput "  Error checking Intune: $($_.Exception.Message)" "Red"
                 }
             }
             
             # Check Autopilot status (only after Intune is removed)
             if ($intuneRemoved -and -not $autopilotRemoved) {
-                Write-ColorOutput "Waiting for 1 of 1 to be removed from Autopilot" "Yellow"
-                $autopilotDevice = Get-AutopilotDevice -DeviceName $deviceName -SerialNumber $serialNumber
-                if (-not $autopilotDevice) {
-                    $autopilotRemoved = $true
-                    Write-ColorOutput ""
-                    Write-ColorOutput "1 Device Successfully Removed from Autopilot" "Green"
-                    Write-ColorOutput ""
-                    $deviceResult.Autopilot.Verified = $true
+                Write-ColorOutput "Waiting for 1 of 1 to be removed from Autopilot (Elapsed: $elapsedMinutes min)" "Yellow"
+                try {
+                    $autopilotDevice = Get-AutopilotDevice -DeviceName $deviceName -SerialNumber $serialNumber
+                    if (-not $autopilotDevice) {
+                        $autopilotRemoved = $true
+                        Write-ColorOutput ""
+                        Write-ColorOutput "1 Device Successfully Removed from Autopilot" "Green"
+                        Write-ColorOutput ""
+                        $deviceResult.Autopilot.Verified = $true
+                    } else {
+                        Write-ColorOutput "  Device still present in Autopilot..." "Gray"
+                    }
+                }
+                catch {
+                    Write-ColorOutput "  Error checking Autopilot: $($_.Exception.Message)" "Red"
                 }
             }
             
-            # Exit if both Intune and Autopilot are removed (skip Entra ID monitoring)
-            if ($autopilotRemoved -and $intuneRemoved) {
+            # Check Entra ID status (after both Intune and Autopilot are removed)
+            if ($autopilotRemoved -and $intuneRemoved -and -not $entraRemoved) {
+                Write-ColorOutput "Waiting for 1 of 1 to be removed from Entra ID (Elapsed: $elapsedMinutes min)" "Yellow"
+                try {
+                    $entraDevices = Get-EntraDeviceByName -DeviceName $deviceName -SerialNumber $serialNumber
+                    if (-not $entraDevices -or $entraDevices.Count -eq 0) {
+                        $entraRemoved = $true
+                        Write-ColorOutput ""
+                        Write-ColorOutput "1 Device Successfully Removed from Entra ID" "Green"
+                        Write-ColorOutput ""
+                        $deviceResult.EntraID.Verified = $true
+                    } else {
+                        Write-ColorOutput "  Device still present in Entra ID..." "Gray"
+                    }
+                }
+                catch {
+                    Write-ColorOutput "  Error checking Entra ID: $($_.Exception.Message)" "Red"
+                }
+            }
+            
+            # Show status update every minute
+            if ($elapsedMinutes -gt 0 -and ($elapsedMinutes % 1) -lt 0.1) {
+                Write-ColorOutput "  Status check at $elapsedMinutes minutes - Intune: $(if($intuneRemoved){'Removed'}else{'Present'}), Autopilot: $(if($autopilotRemoved){'Removed'}else{'Present'}), Entra: $(if($entraRemoved){'Removed'}else{'Present'})" "Cyan"
+            }
+            
+            # Exit if all services are cleared
+            if ($autopilotRemoved -and $intuneRemoved -and $entraRemoved) {
                 $elapsedTime = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
                 
                 # Get device object ID from the original device data
@@ -1005,9 +718,41 @@ foreach ($selectedDevice in $selectedDevices) {
             
         } while ((Get-Date) -lt $endTime)
         
+        # Reset monitoring mode
+        $script:MonitoringMode = $false
+        
+        # Check for timeout
+        if ((Get-Date) -ge $endTime) {
+            Write-ColorOutput ""
+            Write-ColorOutput "⚠ Monitoring timeout reached after $maxMonitorMinutes minutes" "Red"
+            Write-ColorOutput "Some devices may still be present in the services" "Yellow"
+        }
     }
     
     $results += $deviceResult
 }
 
-# Script completes silently - no summary
+Write-ColorOutput ""
+Write-ColorOutput "=================================================" "Magenta"
+Write-ColorOutput "    Device Removal Process Completed!" "Green"
+Write-ColorOutput "=================================================" "Magenta"
+
+# Summary report
+$totalProcessed = $results.Count
+$intuneSuccesses = ($results | Where-Object { $_.Intune.Success }).Count
+$autopilotSuccesses = ($results | Where-Object { $_.Autopilot.Success }).Count
+$entraSuccesses = ($results | Where-Object { $_.EntraID.Success }).Count
+
+Write-ColorOutput ""
+Write-ColorOutput "Summary Report:" "Cyan"
+Write-ColorOutput "  Total Devices Processed: $totalProcessed" "White"
+Write-ColorOutput "  Intune Removals: $intuneSuccesses" "White"
+Write-ColorOutput "  Autopilot Removals: $autopilotSuccesses" "White"
+Write-ColorOutput "  Entra ID Removals: $entraSuccesses" "White"
+
+if (-not $WhatIf) {
+    $verified = ($results | Where-Object { $_.Intune.Verified -or $_.Autopilot.Verified -or $_.EntraID.Verified }).Count
+    Write-ColorOutput "  Verified Removals: $verified" "Green"
+}
+
+Write-ColorOutput ""

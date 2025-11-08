@@ -1,5 +1,4 @@
 #Requires -RunAsAdministrator
-#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.DeviceManagement, Microsoft.Graph.Identity.DirectoryManagement
 
 <#
 .SYNOPSIS
@@ -94,6 +93,63 @@ function Get-CurrentDeviceInfo {
         Write-Log "ERROR: Failed to get device information: $($_.Exception.Message)" "ERROR"
         return $null
     }
+}
+
+# Function to install required modules
+function Install-RequiredModules {
+    param([array]$ModuleNames)
+    
+    Write-Log "Checking and installing required PowerShell modules..."
+    
+    # Set PowerShell Gallery as trusted repository
+    try {
+        $gallery = Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue
+        if ($gallery.InstallationPolicy -ne "Trusted") {
+            Write-Log "Setting PSGallery as trusted repository..."
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -Force
+        }
+    }
+    catch {
+        Write-Log "WARNING: Could not set PSGallery as trusted: $($_.Exception.Message)" "WARNING"
+    }
+    
+    foreach ($moduleName in $ModuleNames) {
+        Write-Log "Checking module: $moduleName"
+        
+        # Check if module is already installed
+        $installedModule = Get-Module -ListAvailable -Name $moduleName -ErrorAction SilentlyContinue
+        
+        if ($installedModule) {
+            Write-Log "Module $moduleName is already installed (Version: $($installedModule[0].Version))"
+        }
+        else {
+            Write-Log "Installing module: $moduleName"
+            try {
+                # Install module for current user (doesn't require admin for machine-wide install)
+                Install-Module -Name $moduleName -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
+                Write-Log "Successfully installed module: $moduleName"
+            }
+            catch {
+                Write-Log "ERROR: Failed to install module $moduleName : $($_.Exception.Message)" "ERROR"
+                return $false
+            }
+        }
+    }
+    
+    # Import modules
+    foreach ($moduleName in $ModuleNames) {
+        try {
+            Write-Log "Importing module: $moduleName"
+            Import-Module $moduleName -Force
+        }
+        catch {
+            Write-Log "ERROR: Failed to import module $moduleName : $($_.Exception.Message)" "ERROR"
+            return $false
+        }
+    }
+    
+    Write-Log "All required modules are installed and imported successfully"
+    return $true
 }
 
 # Function to test Graph connection
@@ -481,6 +537,15 @@ function Show-DeviceCleanupGUI {
                 Update-Status "=== Starting Device Cleanup and Reset ==="
             }
             
+            # Ensure required modules are installed
+            Update-Status "Checking and installing required PowerShell modules..."
+            $requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.DeviceManagement", "Microsoft.Graph.Identity.DirectoryManagement")
+            if (-not (Install-RequiredModules -ModuleNames $requiredModules)) {
+                Update-Status "ERROR: Failed to install required PowerShell modules"
+                return
+            }
+            Update-Status "✓ All required modules are available"
+            
             # Connect to Graph if not already connected
             if (-not $script:GraphConnected) {
                 Update-Status "Connecting to Microsoft Graph..."
@@ -631,6 +696,23 @@ try {
     Write-Log "User: $env:USERNAME"
     Write-Log "Computer: $env:COMPUTERNAME"
     
+    # Set execution policy to bypass for testing purposes
+    try {
+        $currentPolicy = Get-ExecutionPolicy -Scope CurrentUser
+        Write-Log "Current execution policy (CurrentUser): $currentPolicy"
+        
+        if ($currentPolicy -ne "Bypass") {
+            Write-Log "Setting execution policy to Bypass for testing purposes..."
+            Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser -Force
+            Write-Log "Execution policy set to Bypass for CurrentUser scope"
+        } else {
+            Write-Log "Execution policy already set to Bypass"
+        }
+    }
+    catch {
+        Write-Log "WARNING: Could not set execution policy: $($_.Exception.Message)" "WARNING"
+    }
+    
     # Check if running as administrator
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -638,19 +720,12 @@ try {
         exit 1
     }
     
-    # Check for required modules
+    # Install required modules automatically
     $requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.DeviceManagement", "Microsoft.Graph.Identity.DirectoryManagement")
-    $missingModules = @()
     
-    foreach ($module in $requiredModules) {
-        if (-not (Get-Module -ListAvailable -Name $module)) {
-            $missingModules += $module
-        }
-    }
-    
-    if ($missingModules.Count -gt 0) {
-        $message = "Required PowerShell modules are missing:`n`n" + ($missingModules -join "`n") + "`n`nPlease install them using:`nInstall-Module " + ($missingModules -join ", ")
-        [System.Windows.Forms.MessageBox]::Show($message, "Missing Modules", "OK", "Error")
+    Write-Log "Installing required PowerShell modules (this may take a few minutes)..."
+    if (-not (Install-RequiredModules -ModuleNames $requiredModules)) {
+        [System.Windows.Forms.MessageBox]::Show("Failed to install required PowerShell modules. Please check the log file for details.", "Module Installation Failed", "OK", "Error")
         exit 1
     }
     

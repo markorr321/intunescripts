@@ -50,7 +50,7 @@ function Write-Log {
     param(
         [string]$Message,
         [string]$Level = "INFO"
-    )N
+    )
     
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
     $logEntry = "[$timestamp] [$Level] $Message"

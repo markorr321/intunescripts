@@ -201,7 +201,7 @@ function Get-AutopilotDevice {
                 return $AutopilotDevice
             } else {
                 if (-not $script:MonitoringMode) {
-                    Write-ColorOutput "Device with serial $SerialNumber not found in Autopilot, trying by display name..." "Yellow"
+                    Write-ColorOutput "Device with serial $SerialNumber not found in Autopilot" "Yellow"
                 }
             }
         }
@@ -210,27 +210,6 @@ function Get-AutopilotDevice {
         }
     }
     
-    # If not found by serial number or no serial number available, try by display name
-    if (-not $AutopilotDevice -and $DeviceName) {
-        Write-ColorOutput "Searching Autopilot by display name: $DeviceName (using client-side filtering)" "Yellow"
-        try {
-            # Get all Autopilot devices and filter client-side since API doesn't support displayName filtering
-            $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities"
-            $allAutopilotDevices = Get-GraphPagedResults -Uri $uri
-            
-            # Filter by display name (case-insensitive partial match)
-            $AutopilotDevice = $allAutopilotDevices | Where-Object { 
-                $_.displayName -and $_.displayName -like "*$DeviceName*" 
-            } | Select-Object -First 1
-            
-            if ($AutopilotDevice) {
-                Write-ColorOutput "Found Autopilot device matching display name: $($AutopilotDevice.displayName)" "Green"
-            }
-        }
-        catch {
-            Write-ColorOutput "Error searching Autopilot devices by display name: $($_.Exception.Message)" "Red"
-        }
-    }
     
     return $AutopilotDevice
 }

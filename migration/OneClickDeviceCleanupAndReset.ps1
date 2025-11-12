@@ -44,6 +44,7 @@ Add-Type -AssemblyName System.Drawing
 $script:LogPath = "C:\ProgramData\DeviceCleanupReset\DeviceCleanupReset.log"
 $script:CurrentDevice = $null
 $script:GraphConnected = $false
+$script:MonitoringMode = $false
 
 # Function to write log entries
 function Write-Log {
@@ -106,7 +107,7 @@ function Install-RequiredModules {
         $gallery = Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue
         if ($gallery.InstallationPolicy -ne "Trusted") {
             Write-Log "Setting PSGallery as trusted repository..."
-            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -Force
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
         }
     }
     catch {
@@ -296,6 +297,46 @@ function Get-EntraDevice {
     }
 }
 
+# Enhanced: Find Entra ID devices by name with optional serial validation.
+function Get-EntraDeviceByName {
+    param(
+        [string]$DeviceName,
+        [string]$SerialNumber = $null
+    )
+    try {
+        if ([string]::IsNullOrWhiteSpace($DeviceName)) { return @() }
+        $uri = "https://graph.microsoft.com/v1.0/devices?`$filter=displayName eq '$DeviceName'"
+        $aadDevices = (Invoke-MgGraphRequest -Uri $uri -Method GET).value
+        if (-not $aadDevices -or $aadDevices.Count -eq 0) {
+            Write-Log "Device $DeviceName not found in Entra ID" "WARNING"
+            return @()
+        }
+        if ($SerialNumber) {
+            $validated = @()
+            foreach ($aad in $aadDevices) {
+                $deviceSerial = $null
+                if ($aad.physicalIds) {
+                    foreach ($physicalId in $aad.physicalIds) {
+                        if ($physicalId -match '\[SerialNumber\]:(.+)') { $deviceSerial = $matches[1].Trim(); break }
+                    }
+                }
+                if (-not $deviceSerial -or $deviceSerial -eq $SerialNumber) {
+                    $validated += $aad
+                    if ($deviceSerial) { Write-Log "Validated Entra device: $($aad.displayName) (Serial: $deviceSerial)" }
+                } else {
+                    Write-Log "Skipping Entra ID device with ID $($aad.id) - serial mismatch (Device: $deviceSerial, Expected: $SerialNumber)" "WARNING"
+                }
+            }
+            return $validated
+        }
+        return $aadDevices
+    }
+    catch {
+        Write-Log "ERROR: Failed to search Entra ID: $($_.Exception.Message)" "ERROR"
+        return @()
+    }
+}
+
 # Function to remove device from Intune
 function Remove-IntuneDevice {
     param($Device)
@@ -312,7 +353,7 @@ function Remove-IntuneDevice {
         
         $uri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$($Device.id)"
         Invoke-MgGraphRequest -Uri $uri -Method DELETE
-        Write-Log "Successfully removed device from Intune: $($Device.deviceName)"
+        Write-Log "Queued device for removal from Intune: $($Device.deviceName)"
         return @{ Success = $true; Error = $null }
     }
     catch {
@@ -338,7 +379,7 @@ function Remove-AutopilotDevice {
         
         $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/$($Device.id)"
         Invoke-MgGraphRequest -Uri $uri -Method DELETE
-        Write-Log "Successfully removed device from Autopilot: $($Device.displayName)"
+        Write-Log "Queued device for removal from Autopilot: $($Device.displayName)"
         return @{ Success = $true; Error = $null }
     }
     catch {
@@ -348,30 +389,39 @@ function Remove-AutopilotDevice {
     }
 }
 
-# Function to remove device from Entra ID
-function Remove-EntraDevice {
-    param($Device)
-    
-    if (-not $Device) {
-        return @{ Success = $false; Error = "Device not found" }
+# Function to remove one or more devices from Entra ID
+function Remove-EntraDevices {
+    param(
+        [array]$Devices,
+        [string]$DeviceName
+    )
+    if (-not $Devices -or $Devices.Count -eq 0) {
+        return @{ Success = $false; DeletedCount = 0; FailedCount = 0; Errors = @() }
     }
-    
-    try {
-        if ($WhatIf) {
-            Write-Log "WHATIF: Would remove device from Entra ID: $($Device.displayName)"
-            return @{ Success = $true; Error = $null }
+    $deletedCount = 0
+    $failedCount = 0
+    $errors = @()
+    foreach ($aad in $Devices) {
+        try {
+            $uri = "https://graph.microsoft.com/v1.0/devices/$($aad.id)"
+            if ($WhatIf) {
+                Write-Log "WHATIF: Would remove Entra ID device: $($aad.displayName) (ID: $($aad.id))"
+                $deletedCount++
+            } else {
+                Invoke-MgGraphRequest -Uri $uri -Method DELETE
+                $deletedCount++
+                Write-Log "Queued device for removal from Entra ID: $DeviceName"
+            }
         }
-        
-        $uri = "https://graph.microsoft.com/v1.0/devices/$($Device.id)"
-        Invoke-MgGraphRequest -Uri $uri -Method DELETE
-        Write-Log "Successfully removed device from Entra ID: $($Device.displayName)"
-        return @{ Success = $true; Error = $null }
+        catch {
+            $failedCount++
+            $msg = $_.Exception.Message
+            $errors += $msg
+            Write-Log "ERROR: Failed to remove device $DeviceName from Entra ID: $msg" "ERROR"
+        }
     }
-    catch {
-        $error = $_.Exception.Message
-        Write-Log "ERROR: Failed to remove device from Entra ID: $error" "ERROR"
-        return @{ Success = $false; Error = $error }
-    }
+    $success = ($deletedCount -gt 0 -and $failedCount -eq 0)
+    return @{ Success = $success; DeletedCount = $deletedCount; FailedCount = $failedCount; Errors = $errors }
 }
 
 # Function to perform Windows reset
@@ -470,7 +520,7 @@ function Show-DeviceCleanupGUI {
     
     # Warning group
     $warningGroupBox = New-Object System.Windows.Forms.GroupBox
-    $warningGroupBox.Text = "⚠️ Important Warning"
+    $warningGroupBox.Text = "Important Warning"
     $warningGroupBox.Size = New-Object System.Drawing.Size(580, 120)
     $warningGroupBox.Location = New-Object System.Drawing.Point(10, 440)
     $warningGroupBox.ForeColor = "Red"
@@ -478,24 +528,24 @@ function Show-DeviceCleanupGUI {
     $warningLabel = New-Object System.Windows.Forms.Label
     $warningLabel.Size = New-Object System.Drawing.Size(560, 90)
     $warningLabel.Location = New-Object System.Drawing.Point(10, 20)
-    $warningLabel.Text = "• This operation cannot be undone`n• The device will be removed from all Microsoft services`n• Windows will reset and restart multiple times`n• Personal files will be kept, but all applications will be removed`n• Ensure the device is connected to power before proceeding"
+    $warningLabel.Text = "- This operation cannot be undone`n- The device will be removed from all Microsoft services`n- Windows will reset and restart multiple times`n- Personal files will be kept, but all applications will be removed`n- Ensure the device is connected to power before proceeding"
     
     # Buttons
     $executeButton = New-Object System.Windows.Forms.Button
-    $executeButton.Text = "🚀 Execute Cleanup and Reset"
+    $executeButton.Text = "Execute Cleanup and Reset"
     $executeButton.Size = New-Object System.Drawing.Size(200, 40)
     $executeButton.Location = New-Object System.Drawing.Point(50, 580)
     $executeButton.BackColor = "LightGreen"
     $executeButton.Font = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)
     
     $whatIfButton = New-Object System.Windows.Forms.Button
-    $whatIfButton.Text = "🔍 Preview (What-If)"
+    $whatIfButton.Text = "Preview (What-If)"
     $whatIfButton.Size = New-Object System.Drawing.Size(150, 40)
     $whatIfButton.Location = New-Object System.Drawing.Point(270, 580)
     $whatIfButton.BackColor = "LightBlue"
     
     $closeButton = New-Object System.Windows.Forms.Button
-    $closeButton.Text = "❌ Close"
+    $closeButton.Text = "Close"
     $closeButton.Size = New-Object System.Drawing.Size(100, 40)
     $closeButton.Location = New-Object System.Drawing.Point(440, 580)
     $closeButton.BackColor = "LightCoral"
@@ -544,7 +594,7 @@ function Show-DeviceCleanupGUI {
                 Update-Status "ERROR: Failed to install required PowerShell modules"
                 return
             }
-            Update-Status "✓ All required modules are available"
+            Update-Status "[OK] All required modules are available"
             
             # Connect to Graph if not already connected
             if (-not $script:GraphConnected) {
@@ -565,18 +615,17 @@ function Show-DeviceCleanupGUI {
             
             # Find devices in each service
             Update-Status "Searching for device in Microsoft services..."
-            
             $intuneDevice = Get-IntuneDevice -DeviceName $device.ComputerName -SerialNumber $device.SerialNumber
             $autopilotDevice = Get-AutopilotDevice -SerialNumber $device.SerialNumber -DeviceName $device.ComputerName
-            $entraDevice = Get-EntraDevice -DeviceName $device.ComputerName -SerialNumber $device.SerialNumber
+            $entraDevices = Get-EntraDeviceByName -DeviceName $device.ComputerName -SerialNumber $device.SerialNumber
             
             # Report findings
             Update-Status "Device search results:"
             Update-Status "  Intune: $(if ($intuneDevice) { 'Found' } else { 'Not Found' })"
             Update-Status "  Autopilot: $(if ($autopilotDevice) { 'Found' } else { 'Not Found' })"
-            Update-Status "  Entra ID: $(if ($entraDevice) { 'Found' } else { 'Not Found' })"
+            Update-Status "  Entra ID: $(if ($entraDevices -and $entraDevices.Count -gt 0) { 'Found' } else { 'Not Found' })"
             
-            if (-not $intuneDevice -and -not $autopilotDevice -and -not $entraDevice) {
+            if (-not $intuneDevice -and -not $autopilotDevice -and -not ($entraDevices -and $entraDevices.Count -gt 0)) {
                 Update-Status "WARNING: Device not found in any Microsoft services"
                 if (-not $WhatIfMode) {
                     $result = [System.Windows.Forms.MessageBox]::Show("Device not found in Microsoft services. Proceed with Windows reset only?", "Device Not Found", "YesNo", "Question")
@@ -588,7 +637,7 @@ function Show-DeviceCleanupGUI {
             }
             
             # Remove from services
-            if ($intuneDevice -or $autopilotDevice -or $entraDevice) {
+            if ($intuneDevice -or $autopilotDevice -or ($entraDevices -and $entraDevices.Count -gt 0)) {
                 Update-Status "Removing device from Microsoft services..."
                 
                 # Remove from Intune first
@@ -596,9 +645,9 @@ function Show-DeviceCleanupGUI {
                     Update-Status "Removing from Intune..."
                     $result = Remove-IntuneDevice -Device $intuneDevice
                     if ($result.Success) {
-                        Update-Status "✓ Successfully removed from Intune"
+                        Update-Status "[OK] Successfully queued for removal from Intune"
                     } else {
-                        Update-Status "✗ Failed to remove from Intune: $($result.Error)"
+                        Update-Status "[FAIL] Failed to remove from Intune: $($result.Error)"
                     }
                 }
                 
@@ -607,21 +656,68 @@ function Show-DeviceCleanupGUI {
                     Update-Status "Removing from Autopilot..."
                     $result = Remove-AutopilotDevice -Device $autopilotDevice
                     if ($result.Success) {
-                        Update-Status "✓ Successfully removed from Autopilot"
+                        Update-Status "[OK] Successfully queued for removal from Autopilot"
                     } else {
-                        Update-Status "✗ Failed to remove from Autopilot: $($result.Error)"
+                        Update-Status "[FAIL] Failed to remove from Autopilot: $($result.Error)"
                     }
                 }
                 
-                # Remove from Entra ID
-                if ($entraDevice) {
+                # Remove from Entra ID (handle duplicates)
+                if ($entraDevices -and $entraDevices.Count -gt 0) {
                     Update-Status "Removing from Entra ID..."
-                    $result = Remove-EntraDevice -Device $entraDevice
-                    if ($result.Success) {
-                        Update-Status "✓ Successfully removed from Entra ID"
+                    $entraResult = Remove-EntraDevices -Devices $entraDevices -DeviceName $device.ComputerName
+                    if ($entraResult.Success) {
+                        Update-Status "[OK] Successfully queued for removal from Entra ID"
                     } else {
-                        Update-Status "✗ Failed to remove from Entra ID: $($result.Error)"
+                        Update-Status "[FAIL] Failed to remove from Entra ID: $($entraResult.Errors -join '; ')"
                     }
+                }
+            }
+
+            # Post-deletion monitoring (only when not WhatIf)
+            if (-not $WhatIfMode -and ($intuneDevice -or $autopilotDevice -or ($entraDevices -and $entraDevices.Count -gt 0))) {
+                Update-Status "Monitoring device removal..."
+                $startTime = Get-Date
+                $maxMonitorMinutes = 30
+                $endTime = $startTime.AddMinutes($maxMonitorMinutes)
+                $checkInterval = 5
+                $autopilotRemoved = -not $autopilotDevice
+                $intuneRemoved = -not $intuneDevice
+                $entraRemoved = -not ($entraDevices -and $entraDevices.Count -gt 0)
+                do {
+                    Start-Sleep -Seconds $checkInterval
+                    $script:MonitoringMode = $true
+                    $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+                    if (-not $intuneRemoved) {
+                        Update-Status "Waiting for Intune removal (Elapsed: $elapsed min)"
+                        try {
+                            $check = Get-IntuneDevice -DeviceName $device.ComputerName -SerialNumber $device.SerialNumber
+                            if (-not $check) { $intuneRemoved = $true; Update-Status "[OK] Device removed from Intune" }
+                        } catch { Update-Status "Error checking Intune: $($_.Exception.Message)" }
+                    }
+                    if ($intuneRemoved -and -not $autopilotRemoved) {
+                        Update-Status "Waiting for Autopilot removal (Elapsed: $elapsed min)"
+                        try {
+                            $check = Get-AutopilotDevice -SerialNumber $device.SerialNumber -DeviceName $device.ComputerName
+                            if (-not $check) { $autopilotRemoved = $true; Update-Status "[OK] Device removed from Autopilot" }
+                        } catch { Update-Status "Error checking Autopilot: $($_.Exception.Message)" }
+                    }
+                    if ($intuneRemoved -and $autopilotRemoved -and -not $entraRemoved) {
+                        Update-Status "Waiting for Entra ID removal (Elapsed: $elapsed min)"
+                        try {
+                            $checkList = Get-EntraDeviceByName -DeviceName $device.ComputerName -SerialNumber $device.SerialNumber
+                            if (-not $checkList -or $checkList.Count -eq 0) { $entraRemoved = $true; Update-Status "[OK] Device removed from Entra ID" }
+                        } catch { Update-Status "Error checking Entra ID: $($_.Exception.Message)" }
+                    }
+                    if ($intuneRemoved -and $autopilotRemoved -and $entraRemoved) {
+                        Update-Status "Removal verified across all services"
+                        try { [System.Console]::Beep(800,300); [System.Console]::Beep(1000,300); [System.Console]::Beep(1200,500) } catch {}
+                        break
+                    }
+                } while ((Get-Date) -lt $endTime)
+                $script:MonitoringMode = $false
+                if ((Get-Date) -ge $endTime) {
+                    Update-Status "Monitoring timeout reached after $maxMonitorMinutes minutes. Some services may still show the device."
                 }
             }
             
@@ -630,14 +726,14 @@ function Show-DeviceCleanupGUI {
             $resetResult = Start-WindowsReset
             if ($resetResult.Success) {
                 if ($WhatIfMode) {
-                    Update-Status "✓ Windows reset would be initiated (keep files, local reinstall)"
+                    Update-Status "[OK] Windows reset would be initiated (keep files, local reinstall)"
                 } else {
-                    Update-Status "✓ Windows reset scheduled - system will restart in 2 minutes"
+                    Update-Status "[OK] Windows reset scheduled - system will restart in 2 minutes"
                     Update-Status "=== Operation completed successfully ==="
                     [System.Windows.Forms.MessageBox]::Show("Device cleanup and reset initiated successfully!`n`nThe system will restart in 2 minutes to begin the Windows reset process.", "Success", "OK", "Information")
                 }
             } else {
-                Update-Status "✗ Failed to initiate Windows reset: $($resetResult.Error)"
+                Update-Status "[FAIL] Failed to initiate Windows reset: $($resetResult.Error)"
             }
             
             if ($WhatIfMode) {
@@ -719,16 +815,6 @@ try {
         [System.Windows.Forms.MessageBox]::Show("This script must be run as Administrator.`n`nPlease right-click and select 'Run as Administrator'.", "Administrator Required", "OK", "Error")
         exit 1
     }
-    
-    # Install required modules automatically
-    $requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.DeviceManagement", "Microsoft.Graph.Identity.DirectoryManagement")
-    
-    Write-Log "Installing required PowerShell modules (this may take a few minutes)..."
-    if (-not (Install-RequiredModules -ModuleNames $requiredModules)) {
-        [System.Windows.Forms.MessageBox]::Show("Failed to install required PowerShell modules. Please check the log file for details.", "Module Installation Failed", "OK", "Error")
-        exit 1
-    }
-    
     # Show GUI
     Show-DeviceCleanupGUI
     

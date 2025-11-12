@@ -72,6 +72,42 @@ function Write-Log {
     }
 }
 
+# Attempt device reset via MDM WMI Bridge (MDM_RemoteWipe)
+function Start-MDMRemoteWipe {
+    Write-Log "Attempting MDM remote wipe via WMI Bridge..."
+    try {
+        $namespaceName = "root\cimv2\mdm\dmmap"
+        $className = "MDM_RemoteWipe"
+        $methodName = "doWipeMethod"
+        $session = New-CimSession
+        $instance = Get-CimInstance -Namespace $namespaceName -ClassName $className -Filter "ParentID='./Vendor/MSFT' and InstanceID='RemoteWipe'"
+        if (-not $instance) {
+            throw "MDM RemoteWipe instance not found (device may not be MDM-enrolled)"
+        }
+        # Build method parameters (param: empty string)
+        $params = New-Object Microsoft.Management.Infrastructure.CimMethodParametersCollection
+        $param = [Microsoft.Management.Infrastructure.CimMethodParameter]::Create("param", "", [Microsoft.Management.Infrastructure.CimType]::String, [Microsoft.Management.Infrastructure.CimFlags]::In)
+        [void]$params.Add($param)
+
+        if ($WhatIf) {
+            Write-Log "WHATIF: Would invoke MDM RemoteWipe via WMI Bridge"
+            return @{ Success = $true; Error = $null }
+        }
+
+        $null = $session.InvokeMethod($namespaceName, $instance, $methodName, $params)
+        Write-Log "MDM remote wipe initiated successfully"
+        return @{ Success = $true; Error = $null }
+    }
+    catch {
+        $err = $_.Exception.Message
+        Write-Log "ERROR: Failed to initiate MDM remote wipe: $err" "ERROR"
+        return @{ Success = $false; Error = $err }
+    }
+    finally {
+        if ($session) { $session.Dispose() }
+    }
+}
+
 # Function to get current device information
 function Get-CurrentDeviceInfo {
     try {
@@ -429,37 +465,81 @@ function Start-WindowsReset {
     Write-Log "Initiating Windows reset process..."
     
     try {
-        # Check if systemreset is available
-        $systemResetPath = "$env:SystemRoot\System32\systemreset.exe"
+        # Resolve systemreset.exe path (handle 32-bit redirection)
+        $systemResetPath = Join-Path $env:SystemRoot "System32\systemreset.exe"
         if (-not (Test-Path $systemResetPath)) {
-            throw "systemreset.exe not found"
+            if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+                $sysnativePath = Join-Path $env:SystemRoot "Sysnative\systemreset.exe"
+                if (Test-Path $sysnativePath) { $systemResetPath = $sysnativePath }
+            }
         }
+        
+        # WinSxS fallback: locate another copy of systemreset.exe if missing
+        if (-not (Test-Path $systemResetPath)) {
+            try {
+                $candidate = Get-ChildItem -Path (Join-Path $env:SystemRoot "WinSxS") -Filter systemreset.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($candidate -and (Test-Path $candidate.FullName)) {
+                    Write-Log "Found systemreset.exe in WinSxS: $($candidate.FullName)"
+                    $systemResetPath = $candidate.FullName
+                }
+            } catch { }
+        }
+        
+        $hasSystemReset = Test-Path $systemResetPath
+        
+        # Try to ensure Windows RE is enabled (best-effort)
+        try { Start-Process -FilePath "reagentc.exe" -ArgumentList "/enable" -WindowStyle Hidden -NoNewWindow -Wait -ErrorAction SilentlyContinue } catch { }
         
         if ($WhatIf) {
             Write-Log "WHATIF: Would initiate Windows reset (keep files, local reinstall)"
             return @{ Success = $true; Error = $null }
         }
         
-        # Create scheduled task for reset
-        $taskName = "DeviceCleanupReset"
-        $resetCommand = $systemResetPath
-        $resetArgs = "/factoryreset /quiet"
-        
-        # Remove existing task if it exists
-        try {
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        } catch { }
-        
-        # Create scheduled task
-        $action = New-ScheduledTaskAction -Execute $resetCommand -Argument $resetArgs
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Device Cleanup and Reset"
-        
-        Write-Log "Windows reset scheduled to start in 2 minutes"
-        return @{ Success = $true; Error = $null }
+        if ($hasSystemReset) {
+            # Create scheduled task for reset via systemreset.exe
+            $taskName = "DeviceCleanupReset"
+            $resetCommand = $systemResetPath
+            $resetArgs = "/factoryreset /quiet"
+            
+            # Remove existing task if it exists
+            try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+            
+            # Create scheduled task
+            $action = New-ScheduledTaskAction -Execute $resetCommand -Argument $resetArgs
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2)
+            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+            
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Device Cleanup and Reset"
+            Write-Log "Windows reset scheduled to start in 2 minutes"
+            return @{ Success = $true; Error = $null }
+        } else {
+            # Fallback: prompt user for how to proceed
+            Write-Log "systemreset.exe not found. Prompting user for Advanced startup fallback options." "WARNING"
+            $msg = "systemreset.exe is not available on this system.\n\nChoose how to proceed:\n\nYes  = Reboot to Advanced startup NOW\nNo   = Reboot to Advanced startup in 2 minutes\nCancel = Skip Windows reset"
+            $choice = [System.Windows.Forms.MessageBox]::Show($msg, "Windows Reset Fallback", "YesNoCancel", "Question")
+            try {
+                switch ($choice) {
+                    "Yes" {
+                        Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList "/r /o /t 0" -WindowStyle Hidden -NoNewWindow
+                        Write-Log "Rebooting now to Advanced startup. Choose 'Troubleshoot' > 'Reset this PC' after reboot." "WARNING"
+                        return @{ Success = $true; Error = $null }
+                    }
+                    "No" {
+                        Start-Process -FilePath "$env:SystemRoot\System32\shutdown.exe" -ArgumentList "/r /o /t 120" -WindowStyle Hidden -NoNewWindow
+                        Write-Log "System will reboot to Advanced startup in 2 minutes. Choose 'Troubleshoot' > 'Reset this PC' after reboot." "WARNING"
+                        return @{ Success = $true; Error = $null }
+                    }
+                    Default {
+                        Write-Log "User chose to skip Windows reset (no reboot scheduled)." "WARNING"
+                        return @{ Success = $false; Error = "User chose to skip Windows reset" }
+                    }
+                }
+            }
+            catch {
+                throw "Neither systemreset.exe is available nor could we schedule reboot to recovery."
+            }
+        }
     }
     catch {
         $error = $_.Exception.Message
@@ -721,19 +801,29 @@ function Show-DeviceCleanupGUI {
                 }
             }
             
-            # Perform Windows reset
-            Update-Status "Initiating Windows reset..."
-            $resetResult = Start-WindowsReset
-            if ($resetResult.Success) {
+            # Perform reset: try MDM remote wipe first, then fall back to Windows reset
+            Update-Status "Initiating device reset..."
+            $wipeResult = Start-MDMRemoteWipe
+            if ($wipeResult.Success) {
                 if ($WhatIfMode) {
-                    Update-Status "[OK] Windows reset would be initiated (keep files, local reinstall)"
+                    Update-Status "[OK] MDM remote wipe would be initiated"
                 } else {
-                    Update-Status "[OK] Windows reset scheduled - system will restart in 2 minutes"
-                    Update-Status "=== Operation completed successfully ==="
-                    [System.Windows.Forms.MessageBox]::Show("Device cleanup and reset initiated successfully!`n`nThe system will restart in 2 minutes to begin the Windows reset process.", "Success", "OK", "Information")
+                    Update-Status "[OK] MDM remote wipe initiated. The device will reset shortly."
                 }
             } else {
-                Update-Status "[FAIL] Failed to initiate Windows reset: $($resetResult.Error)"
+                Update-Status "MDM remote wipe not available or failed. Falling back to Windows reset..."
+                $resetResult = Start-WindowsReset
+                if ($resetResult.Success) {
+                    if ($WhatIfMode) {
+                        Update-Status "[OK] Windows reset would be initiated (keep files, local reinstall)"
+                    } else {
+                        Update-Status "[OK] Windows reset scheduled or recovery reboot configured"
+                        Update-Status "=== Operation completed successfully ==="
+                        [System.Windows.Forms.MessageBox]::Show("Device cleanup completed. Reset has been initiated or scheduled.", "Success", "OK", "Information")
+                    }
+                } else {
+                    Update-Status "[FAIL] Failed to initiate Windows reset: $($resetResult.Error)"
+                }
             }
             
             if ($WhatIfMode) {

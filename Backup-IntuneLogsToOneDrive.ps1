@@ -112,10 +112,9 @@ function New-LogsZipFile {
 
 function Connect-ToMicrosoftGraph {
     try {
-        Write-ColorOutput "Connecting to Microsoft Graph..." "Cyan"
-        Write-ColorOutput "A browser window will open for authentication. Please sign in with your Microsoft account." "Yellow"
+        Write-ColorOutput "A browser window will open - please sign in with your Microsoft account." "Yellow"
 
-        # Connect with the required scopes for OneDrive access
+        # Connect to Graph - user signs in to access their own OneDrive
         Connect-MgGraph -Scopes @(
             "Files.ReadWrite",
             "User.Read"
@@ -124,14 +123,14 @@ function Connect-ToMicrosoftGraph {
         # Verify connection
         $context = Get-MgContext
         if ($null -eq $context) {
-            throw "Failed to establish Graph connection"
+            throw "Failed to sign in"
         }
 
-        Write-ColorOutput "Successfully connected as: $($context.Account)" "Green"
+        Write-ColorOutput "Signed in as: $($context.Account)" "Green"
         return $true
     }
     catch {
-        Write-ColorOutput "Failed to connect to Microsoft Graph: $($_.Exception.Message)" "Red"
+        Write-ColorOutput "Failed to sign in: $($_.Exception.Message)" "Red"
         return $false
     }
 }
